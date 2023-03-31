@@ -1,58 +1,63 @@
-import { IncomingMessage } from 'http';
-import { Readable } from 'stream';
-import type { Bridge } from '@vercel/node-bridge/bridge';
-import { getVercelLauncher } from '@vercel/node-bridge/launcher.js';
 import { VercelProxyResponse } from '@vercel/node-bridge/types';
+import { createServer, ServerResponse } from 'http';
+import { IncomingMessage } from 'http';
+import { serializeRequest } from '../utils';
+import exitHook from 'exit-hook';
+import { addHelpers } from './helpers';
+import listen from 'async-listen';
+import undici from 'undici';
 
-function rawBody(readable: Readable): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    let bytes = 0;
-    const chunks: Buffer[] = [];
-    readable.on('error', reject);
-    readable.on('data', chunk => {
-      chunks.push(chunk);
-      bytes += chunk.length;
-    });
-    readable.on('end', () => {
-      resolve(Buffer.concat(chunks, bytes));
-    });
+// @ts-expect-error
+import { dynamicImport } from './dynamic-import';
+
+import type { VercelRequest, VercelResponse } from './helpers';
+
+type ServerlessServerOptions = {
+  shouldAddHelpers: boolean;
+  useRequire: boolean;
+};
+
+type ServerlessFunctionSignature = (
+  req: IncomingMessage | VercelRequest,
+  res: ServerResponse | VercelResponse
+) => void;
+
+async function createServerlessServer(
+  userCode: ServerlessFunctionSignature,
+  options: ServerlessServerOptions
+) {
+  const server = createServer((req, res) => {
+    if (options.shouldAddHelpers) addHelpers(req, res);
+    return userCode(req, res);
   });
+  exitHook(server.close);
+  return { url: await listen(server) };
 }
 
 export async function createServerlessEventHandler(
-  entrypoint: string,
-  options: {
-    shouldAddHelpers: boolean;
-    useRequire: boolean;
-  }
+  entrypointPath: string,
+  options: ServerlessServerOptions
 ): Promise<(request: IncomingMessage) => Promise<VercelProxyResponse>> {
-  const launcher = getVercelLauncher({
-    entrypointPath: entrypoint,
-    helpersPath: './helpers.js',
-    shouldAddHelpers: options.shouldAddHelpers,
-    useRequire: options.useRequire,
+  const userCode = options.useRequire
+    ? require(entrypointPath)
+    : await dynamicImport(entrypointPath);
 
-    // not used
-    bridgePath: '',
-    sourcemapSupportPath: '',
-  });
-  const bridge: Bridge = launcher();
+  const server = await createServerlessServer(userCode, options);
 
   return async function (request: IncomingMessage) {
-    const body = await rawBody(request);
-    const event = {
-      Action: 'Invoke',
-      body: JSON.stringify({
-        method: request.method,
-        path: request.url,
-        headers: request.headers,
-        encoding: 'base64',
-        body: body.toString('base64'),
-      }),
-    };
-
-    return bridge.launcher(event, {
-      callbackWaitsForEmptyEventLoop: false,
+    const response = await undici.fetch(server.url, {
+      redirect: 'manual',
+      method: 'post',
+      body: await serializeRequest(request),
+      //@ts-expect-error
+      headers: request.headers,
     });
+
+    return {
+      status: response.status,
+      headers: response.headers,
+      body: response.body,
+      encoding: 'utf8',
+    };
   };
 }
